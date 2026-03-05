@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# C Compiled binaries
+example
+*.o
+*.a
+*.dylib
+*.so
+*.dll
+
+# Generated PDFs and tests
+*.pdf
+
+# Custom script outputs
+/universal-macos/
+/scripts/universal-macos/
+
+# OS generated files
+.DS_Store
