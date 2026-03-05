@@ -37,14 +37,4 @@ overflow-checks = false # 去掉溢出检查
 debug = 0           # 不生成调试符号
 incremental = false # 关闭增量编译，便于 LTO 极致优化
 
-# 专门为macOS优化的profile
-[profile.release-opt]
-inherits = "release"
-opt-level = "z"
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
-overflow-checks = false
-debug = 0
-incremental = false
+
