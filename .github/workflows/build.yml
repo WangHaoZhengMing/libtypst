@@ -17,20 +17,11 @@ jobs:
       - name: Setup Rust with optimization profile
         run: |
           rustup update stable
-          # Create optimized Cargo.toml for release builds
-          cat >> Cargo.toml << 'EOF'
-          
-          [profile.release-opt]
-          inherits = "release"
-          opt-level = "z"          # Optimize for size
-          lto = "fat"              # Full LTO for maximum optimization
-          codegen-units = 1        # Single codegen unit for better optimization
-          panic = "abort"          # Remove panic handling code
-          strip = true             # Strip symbols
-          debug = false            # No debug info
-          overflow-checks = false  # Remove overflow checks
-          incremental = false      # Disable incremental compilation for LTO
-          EOF
+          # Fix ring compilation issue on Apple Silicon
+          export CFLAGS="-O2 -fno-strict-aliasing"
+          export CPPFLAGS="-O2 -fno-strict-aliasing"
+          # Ensure we're using native-tls instead of ring
+          sed -i '' 's/features = \["tls"\]/features = ["native-tls"]/' Cargo.toml
       
       - name: Build Universal Binary with Maximum Optimization
         run: |
