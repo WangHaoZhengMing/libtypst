@@ -1,0 +1,57 @@
+name: macOS Universal Release
+
+on:
+  push:
+    tags:
+      - 'v*' # 当推送 v 开头的 tag 时触发，例如 v0.1.0
+
+permissions:
+  contents: write
+
+jobs:
+  build-mac:
+    name: Build macOS Universal
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin, aarch64-apple-darwin
+
+      - name: Build for x86_64 (Intel)
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Build for aarch64 (Apple Silicon)
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Create Universal Binary
+        run: |
+          mkdir -p dist
+          
+          # 合并静态库 (.a)
+          lipo -create -output dist/libtypst_c.a \
+            target/x86_64-apple-darwin/release/libtypst_c.a \
+            target/aarch64-apple-darwin/release/libtypst_c.a
+            
+          # 合并动态库 (.dylib)
+          lipo -create -output dist/libtypst_c.dylib \
+            target/x86_64-apple-darwin/release/libtypst_c.dylib \
+            target/aarch64-apple-darwin/release/libtypst_c.dylib
+            
+          # 拷贝生成的 C 头文件
+          cp include/typst_c.h dist/
+          
+          # 创建压缩包
+          cd dist
+          tar -czvf macos-universal-libtypst_c.tar.gz libtypst_c.a libtypst_c.dylib typst_c.h
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/macos-universal-libtypst_c.tar.gz
+          generate_release_notes: true
