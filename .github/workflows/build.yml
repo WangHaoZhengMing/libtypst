@@ -1,0 +1,110 @@
+name: Build Typst C Bridge
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-mac:
+    name: Build macOS (Universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Build Universal Binary
+        run: |
+          chmod +x scripts/build_mac.sh
+          ./scripts/build_mac.sh
+
+      - name: Package
+        run: |
+          mkdir -p macos-artifacts
+          cp universal-macos/* macos-artifacts/
+          cp include/typst_c.h macos-artifacts/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: libtypst_c-macos-universal
+          path: macos-artifacts/
+
+  build-linux:
+    name: Build Linux (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Rust
+        run: |
+          rustup update stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Install Cross for ARM64
+        if: matrix.arch == 'arm64'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            # Ubuntu x86_64 compiling for linux-arm64 easily with cross
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        run: |
+          mkdir -p linux-artifacts
+          cp target/${{ matrix.target }}/release/libtypst_c.a linux-artifacts/
+          cp target/${{ matrix.target }}/release/libtypst_c.so linux-artifacts/ || true
+          cp include/typst_c.h linux-artifacts/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: libtypst_c-linux-${{ matrix.arch }}
+          path: linux-artifacts/
+
+  build-windows:
+    name: Build Windows (${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Rust
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p windows-artifacts
+          cp target/${{ matrix.target }}/release/typst_c.lib windows-artifacts/ || true
+          cp target/${{ matrix.target }}/release/typst_c.dll windows-artifacts/ || true
+          cp target/${{ matrix.target }}/release/libtypst_c.a windows-artifacts/ || true
+          cp include/typst_c.h windows-artifacts/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: libtypst_c-windows-${{ matrix.arch }}
+          path: windows-artifacts/
