@@ -14,16 +14,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Build Universal Binary
+      - name: Setup Rust with optimization profile
+        run: |
+          rustup update stable
+          # Create optimized Cargo.toml for release builds
+          cat >> Cargo.toml << 'EOF'
+          
+          [profile.release-opt]
+          inherits = "release"
+          opt-level = "z"          # Optimize for size
+          lto = "fat"              # Full LTO for maximum optimization
+          codegen-units = 1        # Single codegen unit for better optimization
+          panic = "abort"          # Remove panic handling code
+          strip = true             # Strip symbols
+          debug = false            # No debug info
+          overflow-checks = false  # Remove overflow checks
+          incremental = false      # Disable incremental compilation for LTO
+          EOF
+      
+      - name: Build Universal Binary with Maximum Optimization
         run: |
           chmod +x scripts/build_mac.sh
-          ./scripts/build_mac.sh
+          # Set environment variables for maximum optimization
+          export CARGO_PROFILE_RELEASE_OPT_LEVEL=z
+          export CARGO_PROFILE_RELEASE_LTO=fat
+          export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+          export CARGO_PROFILE_RELEASE_PANIC=abort
+          export CARGO_PROFILE_RELEASE_STRIP=symbols
+          export CARGO_PROFILE_RELEASE_DEBUG=false
+          export CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=false
+          export CARGO_PROFILE_RELEASE_INCREMENTAL=false
+          export RUSTFLAGS="-C target-cpu=native -C link-arg=-Wl,-dead_strip"
+          ./scripts/build_mac.sh --profile release-opt
 
       - name: Package
         run: |
           mkdir -p macos-artifacts
           cp universal-macos/* macos-artifacts/
           cp include/typst_c.h macos-artifacts/
+          # Show final binary sizes
+          echo "=== macOS Universal Binary Sizes ==="
+          ls -lh macos-artifacts/
+          echo "===================================="
 
       - name: Upload
         uses: actions/upload-artifact@v4
@@ -44,16 +76,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Setup Rust
+      - name: Setup Rust with optimization
         run: |
           rustup update stable
           rustup target add ${{ matrix.target }}
+          # Set optimization environment variables
+          echo "CARGO_PROFILE_RELEASE_OPT_LEVEL=z" >> $GITHUB_ENV
+          echo "CARGO_PROFILE_RELEASE_LTO=fat" >> $GITHUB_ENV
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1" >> $GITHUB_ENV
+          echo "CARGO_PROFILE_RELEASE_PANIC=abort" >> $GITHUB_ENV
+          echo "CARGO_PROFILE_RELEASE_STRIP=symbols" >> $GITHUB_ENV
+          echo "CARGO_PROFILE_RELEASE_DEBUG=false" >> $GITHUB_ENV
+          echo "CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=false" >> $GITHUB_ENV
 
       - name: Install Cross for ARM64
         if: matrix.arch == 'arm64'
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build
+      - name: Build with Size Optimization
+        env:
+          RUSTFLAGS: "-C target-cpu=native -C link-arg=-Wl,--gc-sections -C link-arg=-Wl,--strip-all"
         run: |
           if [ "${{ matrix.arch }}" = "arm64" ]; then
             # Ubuntu x86_64 compiling for linux-arm64 easily with cross
@@ -68,6 +110,10 @@ jobs:
           cp target/${{ matrix.target }}/release/libtypst_c.a linux-artifacts/
           cp target/${{ matrix.target }}/release/libtypst_c.so linux-artifacts/ || true
           cp include/typst_c.h linux-artifacts/
+          # Show binary sizes
+          echo "=== Linux ${{ matrix.arch }} Binary Sizes ==="
+          ls -lh linux-artifacts/
+          echo "============================================="
 
       - name: Upload
         uses: actions/upload-artifact@v4
@@ -88,10 +134,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Setup Rust
-        run: rustup target add ${{ matrix.target }}
+      - name: Setup Rust with optimization
+        run: |
+          rustup target add ${{ matrix.target }}
+          # Set optimization environment variables
+          echo "CARGO_PROFILE_RELEASE_OPT_LEVEL=z" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CARGO_PROFILE_RELEASE_LTO=fat" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CARGO_PROFILE_RELEASE_PANIC=abort" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CARGO_PROFILE_RELEASE_STRIP=symbols" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CARGO_PROFILE_RELEASE_DEBUG=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Build
+      - name: Build with Size Optimization
+        env:
+          RUSTFLAGS: "-C target-cpu=native -C link-arg=/OPT:REF -C link-arg=/OPT:ICF"
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
@@ -102,9 +159,35 @@ jobs:
           cp target/${{ matrix.target }}/release/typst_c.dll windows-artifacts/ || true
           cp target/${{ matrix.target }}/release/libtypst_c.a windows-artifacts/ || true
           cp include/typst_c.h windows-artifacts/
+          # Show binary sizes
+          echo "=== Windows ${{ matrix.arch }} Binary Sizes ==="
+          ls -lh windows-artifacts/
+          echo "=============================================="
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: libtypst_c-windows-${{ matrix.arch }}
           path: windows-artifacts/
+
+  publish-release:
+    name: Publish Release
+    needs: [build-mac, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: all-artifacts/**/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

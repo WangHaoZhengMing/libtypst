@@ -6,12 +6,13 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
-use parking_lot::RwLock;
+use parking_lot::{RwLock, Mutex};
 use typst::diag::{FileError, FileResult};
 use typst::foundations::{Bytes, Datetime};
 use typst::utils::LazyHash;
@@ -22,6 +23,7 @@ use typst::{Library, LibraryExt, World};
 use typst_pdf::PdfOptions;
 
 /// 编译结果状态码
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 #[repr(C)]
 pub enum TypstResult {
     /// 编译成功
@@ -52,7 +54,7 @@ pub struct TypstPdfBuffer {
     /// PDF 数据长度
     pub len: usize,
     /// 容量（内部使用）
-    capacity: usize,
+    pub capacity: usize,
 }
 
 /// 编译错误信息
@@ -73,6 +75,18 @@ pub struct TypstErrorList {
     pub errors: *mut TypstError,
     /// 错误数量
     pub count: usize,
+}
+
+// ============================================================================
+// 全局包管理
+// ============================================================================
+
+/// 全局包缓存，避免重复下载检查
+static PACKAGE_CACHE: OnceLock<Arc<Mutex<HashMap<String, PathBuf>>>> = OnceLock::new();
+
+/// 获取包缓存实例
+fn get_package_cache() -> &'static Arc<Mutex<HashMap<String, PathBuf>>> {
+    PACKAGE_CACHE.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
 }
 
 // ============================================================================
@@ -153,8 +167,24 @@ impl SimpleWorld {
         }
     }
 
-    /// 下载并解压包
+    /// 下载并解压包（优化版本）
     fn download_package(spec: &typst::syntax::package::PackageSpec) -> FileResult<PathBuf> {
+        let package_key = format!("{}/{}/{}", spec.namespace, spec.name, spec.version);
+        
+        // 检查全局缓存
+        {
+            let cache = get_package_cache().lock();
+            if let Some(path) = cache.get(&package_key) {
+                if path.exists() {
+                    eprintln!("[CACHE] Using cached package: {}", package_key);
+                    return Ok(path.clone());
+                }
+            }
+        }
+        
+        eprintln!("[DOWNLOAD] Starting download for package: {}", package_key);
+        
+        // 标准缓存路径
         let cache_dir = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".cache"))
             .join("typst")
             .join("packages")
@@ -162,47 +192,102 @@ impl SimpleWorld {
             .join(spec.name.as_str())
             .join(spec.version.to_string());
 
+        let data_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".cache"))
+            .join("typst")
+            .join("packages")
+            .join(spec.namespace.as_str())
+            .join(spec.name.as_str())
+            .join(spec.version.to_string());
+
+        // 检查本地缓存
+        if data_dir.exists() {
+            get_package_cache().lock().insert(package_key, data_dir.clone());
+            return Ok(data_dir);
+        }
         if cache_dir.exists() {
+            get_package_cache().lock().insert(package_key.clone(), cache_dir.clone());
             return Ok(cache_dir);
         }
-
-        let url = format!(
-            "https://packages.typst.org/{}/{}-{}.tar.gz",
-            spec.namespace, spec.name, spec.version
-        );
-
-        let response = match ureq::get(&url).call() {
-            Ok(resp) => resp,
-            Err(_) => return Err(FileError::NotFound(cache_dir)),
-        };
-
-        fs::create_dir_all(&cache_dir).map_err(|e| FileError::from_io(e, &cache_dir))?;
-
-        let gz = flate2::read::GzDecoder::new(response.into_reader());
-        let mut archive = tar::Archive::new(gz);
         
-        // Typst的包结构多嵌套了一层，需要正确提取
-        for file in archive.entries().map_err(|e| FileError::from_io(e, &cache_dir))? {
-            let mut file = match file {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
+        eprintln!("[DOWNLOAD] Package not cached, downloading: {}", package_key);
+        
+        // 通过GitHub API逐文件下载（优化版本）
+        Self::download_package_files(spec, &cache_dir).map(|path| {
+            get_package_cache().lock().insert(package_key, path.clone());
+            path
+        })
+    }
+    
+    /// 通过GitHub API逐文件下载（优化内存使用）
+    /// 通过GitHub API逐文件下载（优化内存使用）
+    fn download_package_files(spec: &typst::syntax::package::PackageSpec, cache_dir: &Path) -> FileResult<PathBuf> {
+        fs::create_dir_all(&cache_dir).map_err(|e| FileError::from_io(e, &cache_dir))?;
+        
+        let mut file_count = 0;
+        
+        fn download_directory(path: &str, local_dir: &Path, file_count: &mut usize) -> Result<(), Box<dyn std::error::Error>> {
+            let api_url = format!("https://api.github.com/repos/typst/packages/contents/{}", path);
             
-            let path = file.path().unwrap().into_owned();
-            // 去除最外层文件夹
-            let stripped_path = match path.components().skip(1).collect::<PathBuf>() {
-                p if p.components().count() == 0 => continue,
-                p => p,
-            };
+            let response = ureq::get(&api_url)
+                .set("User-Agent", "libtypst-c/0.1.0")
+                .timeout(std::time::Duration::from_secs(30))  // 添加超时
+                .call()?;
             
-            let dest_path = cache_dir.join(stripped_path);
-            if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent).ok();
+            // 限制响应大小以节省内存
+            let json_str = response.into_string()?;
+            let entries: Vec<serde_json::Value> = serde_json::from_str(&json_str)?;
+            
+            for entry in entries {
+                if let (Some(name), Some(entry_type)) = (
+                    entry["name"].as_str(),
+                    entry["type"].as_str(),
+                ) {
+                    let local_path = local_dir.join(name);
+                    
+                    if entry_type == "file" {
+                        if let Some(download_url) = entry["download_url"].as_str() {
+                            *file_count += 1;
+                            eprintln!("[DOWNLOAD] Downloading file {}: {}", *file_count, name);
+                            
+                            // 流式下载，减少内存使用
+                            let response = ureq::get(download_url)
+                                .timeout(std::time::Duration::from_secs(30))
+                                .call()?;
+                            
+                            if name.ends_with(".wasm") || name.ends_with(".png") || 
+                               name.ends_with(".jpg") || name.ends_with(".jpeg") ||
+                               name.ends_with(".pdf") {
+                                // 二进制文件：直接流式写入
+                                let mut file = std::fs::File::create(&local_path)?;
+                                let mut reader = response.into_reader();
+                                std::io::copy(&mut reader, &mut file)?;
+                            } else {
+                                // 文本文件：读取为字符串
+                                let content = response.into_string()?;
+                                std::fs::write(&local_path, content)?;
+                            }
+                        }
+                    } else if entry_type == "dir" {
+                        eprintln!("[DOWNLOAD] Entering directory: {}", name);
+                        std::fs::create_dir_all(&local_path)?;
+                        let sub_path = format!("{}/{}", path, name);
+                        download_directory(&sub_path, &local_path, file_count)?;
+                    }
+                }
             }
-            file.unpack(&dest_path).ok();
+            Ok(())
         }
-
-        Ok(cache_dir)
+        
+        let package_path = format!("packages/{}/{}/{}", spec.namespace, spec.name, spec.version);
+        
+        download_directory(&package_path, &cache_dir, &mut file_count)
+            .map_err(|e| {
+                eprintln!("[DOWNLOAD] Failed to download package: {:?}", e);
+                FileError::NotFound(cache_dir.to_path_buf())
+            })?;
+        
+        eprintln!("[DOWNLOAD] Package downloaded successfully! {} files total", file_count);
+        Ok(cache_dir.to_path_buf())
     }
     fn resolve_path(&self, id: FileId) -> FileResult<PathBuf> {
         if let Some(spec) = id.package() {
@@ -454,10 +539,16 @@ pub unsafe extern "C" fn typst_compile_to_buffer(
                     *out_buffer = buffer;
                     TypstResult::Success
                 }
-                Err(_) => TypstResult::ExportError,
+                Err(e) => {
+                    eprintln!("PDF EXPORT ERROR: {:?}", e);
+                    TypstResult::ExportError
+                }
             }
         }
-        Err(_) => TypstResult::CompileError,
+        Err(e) => {
+            eprintln!("COMPILE ERROR: {:?}", e);
+            TypstResult::CompileError
+        }
     }
 }
 
