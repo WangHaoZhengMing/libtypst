@@ -2,6 +2,7 @@ use std::ffi::{CStr, c_char};
 use std::fs;
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::{Mutex, OnceLock};
 
 use typst::layout::PagedDocument;
 use typst_pdf::PdfOptions;
@@ -20,6 +21,36 @@ pub extern "C" fn typst_set_network_downloader(cb: TypstDownloadFunc) {
 }
 
 pub static mut SHARED_GROUP_PATH: Option<String> = None;
+
+static LAST_ERROR_MESSAGE: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+
+fn last_error_storage() -> &'static Mutex<Vec<u8>> {
+    LAST_ERROR_MESSAGE.get_or_init(|| Mutex::new(b"Unknown error\0".to_vec()))
+}
+
+fn set_last_error_message(message: impl Into<String>) {
+    let mut bytes = message.into().into_bytes();
+    bytes.retain(|byte| *byte != 0);
+    bytes.push(0);
+    if let Ok(mut guard) = last_error_storage().lock() {
+        *guard = bytes;
+    }
+}
+
+fn set_default_error_message(result: TypstResult) {
+    let message = match result {
+        TypstResult::Success => "Success",
+        TypstResult::InvalidInputPath => "Invalid input path",
+        TypstResult::InvalidOutputPath => "Invalid output path",
+        TypstResult::ReadError => "Failed to read file",
+        TypstResult::CompileError => "Compilation error",
+        TypstResult::ExportError => "PDF export error",
+        TypstResult::WriteError => "Failed to write file",
+        TypstResult::InvalidUtf8 => "Invalid UTF-8 string",
+        TypstResult::MemoryError => "Memory allocation error",
+    };
+    set_last_error_message(message);
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn typst_set_shared_group_path(path: *const c_char) {
@@ -99,25 +130,37 @@ pub unsafe extern "C" fn typst_compile_file(
     input_path: *const c_char,
     output_path: *const c_char,
 ) -> TypstResult {
+    set_default_error_message(TypstResult::Success);
     if input_path.is_null() {
+        set_default_error_message(TypstResult::InvalidInputPath);
         return TypstResult::InvalidInputPath;
     }
     if output_path.is_null() {
+        set_default_error_message(TypstResult::InvalidOutputPath);
         return TypstResult::InvalidOutputPath;
     }
 
     let input = match CStr::from_ptr(input_path).to_str() {
         Ok(s) => PathBuf::from(s),
-        Err(_) => return TypstResult::InvalidUtf8,
+        Err(_) => {
+            set_default_error_message(TypstResult::InvalidUtf8);
+            return TypstResult::InvalidUtf8;
+        }
     };
     let output = match CStr::from_ptr(output_path).to_str() {
         Ok(s) => PathBuf::from(s),
-        Err(_) => return TypstResult::InvalidUtf8,
+        Err(_) => {
+            set_default_error_message(TypstResult::InvalidUtf8);
+            return TypstResult::InvalidUtf8;
+        }
     };
 
     let source = match fs::read_to_string(&input) {
         Ok(s) => s,
-        Err(_) => return TypstResult::ReadError,
+        Err(e) => {
+            set_last_error_message(format!("Failed to read file {}: {}", input.display(), e));
+            return TypstResult::ReadError;
+        }
     };
 
     let root = input.parent();
@@ -132,18 +175,21 @@ pub unsafe extern "C" fn typst_compile_file(
                         Ok(_) => TypstResult::Success,
                         Err(e) => {
                             eprintln!("WRITE ERROR: {:?}", e);
+                            set_last_error_message(format!("Failed to write PDF {}: {}", output.display(), e));
                             TypstResult::WriteError
                         }
                     }
                 }
                 Err(e) => {
                     eprintln!("EXPORT ERROR: {:?}", e);
+                    set_last_error_message(format!("PDF export error: {:?}", e));
                     TypstResult::ExportError
                 }
             }
         }
         Err(e) => {
             eprintln!("COMPILE ERROR: {:?}", e);
+            set_last_error_message(format!("{:?}", e));
             TypstResult::CompileError
         }
     }
@@ -156,27 +202,39 @@ pub unsafe extern "C" fn typst_compile_string(
     output_path: *const c_char,
     root_path: *const c_char,
 ) -> TypstResult {
+    set_default_error_message(TypstResult::Success);
     if source.is_null() {
+        set_default_error_message(TypstResult::InvalidInputPath);
         return TypstResult::InvalidInputPath;
     }
     if output_path.is_null() {
+        set_default_error_message(TypstResult::InvalidOutputPath);
         return TypstResult::InvalidOutputPath;
     }
 
     let source_str = match CStr::from_ptr(source).to_str() {
         Ok(s) => s,
-        Err(_) => return TypstResult::InvalidUtf8,
+        Err(_) => {
+            set_default_error_message(TypstResult::InvalidUtf8);
+            return TypstResult::InvalidUtf8;
+        }
     };
     let output = match CStr::from_ptr(output_path).to_str() {
         Ok(s) => PathBuf::from(s),
-        Err(_) => return TypstResult::InvalidUtf8,
+        Err(_) => {
+            set_default_error_message(TypstResult::InvalidUtf8);
+            return TypstResult::InvalidUtf8;
+        }
     };
     let root = if root_path.is_null() {
         None
     } else {
         match CStr::from_ptr(root_path).to_str() {
             Ok(s) => Some(PathBuf::from(s)),
-            Err(_) => return TypstResult::InvalidUtf8,
+            Err(_) => {
+                set_default_error_message(TypstResult::InvalidUtf8);
+                return TypstResult::InvalidUtf8;
+            }
         }
     };
 
@@ -189,13 +247,22 @@ pub unsafe extern "C" fn typst_compile_string(
                 Ok(pdf_data) => {
                     match fs::write(&output, pdf_data) {
                         Ok(_) => TypstResult::Success,
-                        Err(_) => TypstResult::WriteError,
+                        Err(e) => {
+                            set_last_error_message(format!("Failed to write PDF {}: {}", output.display(), e));
+                            TypstResult::WriteError
+                        }
                     }
                 }
-                Err(_) => TypstResult::ExportError,
+                Err(e) => {
+                    set_last_error_message(format!("PDF export error: {:?}", e));
+                    TypstResult::ExportError
+                }
             }
         }
-        Err(_) => TypstResult::CompileError,
+        Err(e) => {
+            set_last_error_message(format!("{:?}", e));
+            TypstResult::CompileError
+        }
     }
 }
 
@@ -206,20 +273,28 @@ pub unsafe extern "C" fn typst_compile_to_buffer(
     root_path: *const c_char,
     out_buffer: *mut TypstPdfBuffer,
 ) -> TypstResult {
+    set_default_error_message(TypstResult::Success);
     if source.is_null() || out_buffer.is_null() {
+        set_default_error_message(TypstResult::InvalidInputPath);
         return TypstResult::InvalidInputPath;
     }
 
     let source_str = match CStr::from_ptr(source).to_str() {
         Ok(s) => s,
-        Err(_) => return TypstResult::InvalidUtf8,
+        Err(_) => {
+            set_default_error_message(TypstResult::InvalidUtf8);
+            return TypstResult::InvalidUtf8;
+        }
     };
     let root = if root_path.is_null() {
         None
     } else {
         match CStr::from_ptr(root_path).to_str() {
             Ok(s) => Some(PathBuf::from(s)),
-            Err(_) => return TypstResult::InvalidUtf8,
+            Err(_) => {
+                set_default_error_message(TypstResult::InvalidUtf8);
+                return TypstResult::InvalidUtf8;
+            }
         }
     };
 
@@ -241,12 +316,14 @@ pub unsafe extern "C" fn typst_compile_to_buffer(
                 }
                 Err(e) => {
                     eprintln!("PDF EXPORT ERROR: {:?}", e);
+                    set_last_error_message(format!("PDF export error: {:?}", e));
                     TypstResult::ExportError
                 }
             }
         }
         Err(e) => {
             eprintln!("COMPILE ERROR: {:?}", e);
+            set_last_error_message(format!("{:?}", e));
             TypstResult::CompileError
         }
     }
@@ -270,18 +347,10 @@ pub unsafe extern "C" fn typst_free_buffer(buffer: *mut TypstPdfBuffer) {
 /// 获取错误信息字符串
 #[unsafe(no_mangle)]
 pub extern "C" fn typst_result_message(result: TypstResult) -> *const c_char {
-    let msg = match result {
-        TypstResult::Success => "Success\0",
-        TypstResult::InvalidInputPath => "Invalid input path\0",
-        TypstResult::InvalidOutputPath => "Invalid output path\0",
-        TypstResult::ReadError => "Failed to read file\0",
-        TypstResult::CompileError => "Compilation error\0",
-        TypstResult::ExportError => "PDF export error\0",
-        TypstResult::WriteError => "Failed to write file\0",
-        TypstResult::InvalidUtf8 => "Invalid UTF-8 string\0",
-        TypstResult::MemoryError => "Memory allocation error\0",
-    };
-    msg.as_ptr() as *const c_char
+    match last_error_storage().lock() {
+        Ok(guard) => guard.as_ptr() as *const c_char,
+        Err(_) => b"Unknown error\0".as_ptr() as *const c_char,
+    }
 }
 
 /// 获取库版本

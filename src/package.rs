@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use typst::diag::{FileError, FileResult};
 use typst::syntax::package::PackageSpec;
-use typst_kit::download::{Downloader, ProgressSink};
 use typst_kit::package::PackageStorage;
 use std::ffi::CString;
 
@@ -10,7 +9,7 @@ fn get_packages_base_dir() -> PathBuf {
     // 1. 优先尝试从宿主传递的 App Group 共享目录取包 (如果有设置)
     unsafe {
         if let Some(ref group_path) = crate::ffi::SHARED_GROUP_PATH {
-            return PathBuf::from(group_path).join("typst_packages");
+            return PathBuf::from(group_path).join("packages");
         }
     }
     
@@ -69,14 +68,8 @@ pub fn download_package(spec: &PackageSpec) -> FileResult<PathBuf> {
         }
     }
 
-    // fallback: 如果一切由于沙盒或网络被禁止，那么这一步依然会用 typst-kit 的内置去跑
-    let downloader = Downloader::new("libtypst-c/0.1.0");
-    let cache_dir = temp_base.join("cache");
-    let data_dir = temp_base.join("data");
-    
-    let storage = PackageStorage::new(Some(cache_dir.clone()), Some(data_dir.clone()), downloader);
-    
-    storage
-        .prepare_package(spec, &mut ProgressSink)
-        .map_err(|e| FileError::Package(e))
+    // fallback: 取消内置网络下载的尝试
+    // (因为 QuickLook Sandbox 会直接 abort 尝试向 mDNS / socket 发起连接的程序)
+    // 应该直接抛错，由宿主 App 接管下载流程。
+    Err(FileError::NotFound(package_dir))
 }
