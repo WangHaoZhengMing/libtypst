@@ -1,0 +1,256 @@
+use std::ffi::{CStr, c_char};
+use std::fs;
+use std::path::PathBuf;
+use std::ptr;
+
+use typst::layout::PagedDocument;
+use typst_pdf::PdfOptions;
+
+use crate::world::SimpleWorld;
+
+/// 编译结果状态码
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[repr(C)]
+pub enum TypstResult {
+    /// 编译成功
+    Success = 0,
+    /// 输入文件路径无效
+    InvalidInputPath = 1,
+    /// 输出文件路径无效
+    InvalidOutputPath = 2,
+    /// 读取文件失败
+    ReadError = 3,
+    /// 编译错误
+    CompileError = 4,
+    /// PDF 导出错误
+    ExportError = 5,
+    /// 写入文件失败
+    WriteError = 6,
+    /// 无效的 UTF-8 字符串
+    InvalidUtf8 = 7,
+    /// 内存分配失败
+    MemoryError = 8,
+}
+
+/// PDF 输出缓冲区
+#[repr(C)]
+pub struct TypstPdfBuffer {
+    /// 指向 PDF 数据的指针
+    pub data: *mut u8,
+    /// PDF 数据长度
+    pub len: usize,
+    /// 容量（内部使用）
+    pub capacity: usize,
+}
+
+/// 编译错误信息
+#[repr(C)]
+pub struct TypstError {
+    /// 错误消息
+    pub message: *mut c_char,
+    /// 错误行号（从1开始，0表示未知）
+    pub line: u32,
+    /// 错误列号（从1开始，0表示未知）
+    pub column: u32,
+}
+
+/// 错误列表
+#[repr(C)]
+pub struct TypstErrorList {
+    /// 错误数组
+    pub errors: *mut TypstError,
+    /// 错误数量
+    pub count: usize,
+}
+
+// ============================================================================
+// C FFI 函数
+// ============================================================================
+
+/// 从文件编译 Typst 到 PDF 文件
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn typst_compile_file(
+    input_path: *const c_char,
+    output_path: *const c_char,
+) -> TypstResult {
+    if input_path.is_null() {
+        return TypstResult::InvalidInputPath;
+    }
+    if output_path.is_null() {
+        return TypstResult::InvalidOutputPath;
+    }
+
+    let input = match CStr::from_ptr(input_path).to_str() {
+        Ok(s) => PathBuf::from(s),
+        Err(_) => return TypstResult::InvalidUtf8,
+    };
+    let output = match CStr::from_ptr(output_path).to_str() {
+        Ok(s) => PathBuf::from(s),
+        Err(_) => return TypstResult::InvalidUtf8,
+    };
+
+    let source = match fs::read_to_string(&input) {
+        Ok(s) => s,
+        Err(_) => return TypstResult::ReadError,
+    };
+
+    let root = input.parent();
+    let world = SimpleWorld::new(&source, root);
+    
+    match typst::compile::<PagedDocument>(&world).output {
+        Ok(document) => {
+            let options = PdfOptions::default();
+            match typst_pdf::pdf(&document, &options) {
+                Ok(pdf_data) => {
+                    match fs::write(&output, pdf_data) {
+                        Ok(_) => TypstResult::Success,
+                        Err(_) => TypstResult::WriteError,
+                    }
+                }
+                Err(_) => TypstResult::ExportError,
+            }
+        }
+        Err(_) => TypstResult::CompileError,
+    }
+}
+
+/// 从字符串编译 Typst 到 PDF 文件
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn typst_compile_string(
+    source: *const c_char,
+    output_path: *const c_char,
+    root_path: *const c_char,
+) -> TypstResult {
+    if source.is_null() {
+        return TypstResult::InvalidInputPath;
+    }
+    if output_path.is_null() {
+        return TypstResult::InvalidOutputPath;
+    }
+
+    let source_str = match CStr::from_ptr(source).to_str() {
+        Ok(s) => s,
+        Err(_) => return TypstResult::InvalidUtf8,
+    };
+    let output = match CStr::from_ptr(output_path).to_str() {
+        Ok(s) => PathBuf::from(s),
+        Err(_) => return TypstResult::InvalidUtf8,
+    };
+    let root = if root_path.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(root_path).to_str() {
+            Ok(s) => Some(PathBuf::from(s)),
+            Err(_) => return TypstResult::InvalidUtf8,
+        }
+    };
+
+    let world = SimpleWorld::new(source_str, root.as_deref());
+    
+    match typst::compile::<PagedDocument>(&world).output {
+        Ok(document) => {
+            let options = PdfOptions::default();
+            match typst_pdf::pdf(&document, &options) {
+                Ok(pdf_data) => {
+                    match fs::write(&output, pdf_data) {
+                        Ok(_) => TypstResult::Success,
+                        Err(_) => TypstResult::WriteError,
+                    }
+                }
+                Err(_) => TypstResult::ExportError,
+            }
+        }
+        Err(_) => TypstResult::CompileError,
+    }
+}
+
+/// 从字符串编译 Typst 到内存缓冲区
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn typst_compile_to_buffer(
+    source: *const c_char,
+    root_path: *const c_char,
+    out_buffer: *mut TypstPdfBuffer,
+) -> TypstResult {
+    if source.is_null() || out_buffer.is_null() {
+        return TypstResult::InvalidInputPath;
+    }
+
+    let source_str = match CStr::from_ptr(source).to_str() {
+        Ok(s) => s,
+        Err(_) => return TypstResult::InvalidUtf8,
+    };
+    let root = if root_path.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(root_path).to_str() {
+            Ok(s) => Some(PathBuf::from(s)),
+            Err(_) => return TypstResult::InvalidUtf8,
+        }
+    };
+
+    let world = SimpleWorld::new(source_str, root.as_deref());
+    
+    match typst::compile::<PagedDocument>(&world).output {
+        Ok(document) => {
+            let options = PdfOptions::default();
+            match typst_pdf::pdf(&document, &options) {
+                Ok(mut pdf_data) => {
+                    let buffer = TypstPdfBuffer {
+                        data: pdf_data.as_mut_ptr(),
+                        len: pdf_data.len(),
+                        capacity: pdf_data.capacity(),
+                    };
+                    std::mem::forget(pdf_data);
+                    *out_buffer = buffer;
+                    TypstResult::Success
+                }
+                Err(e) => {
+                    eprintln!("PDF EXPORT ERROR: {:?}", e);
+                    TypstResult::ExportError
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("COMPILE ERROR: {:?}", e);
+            TypstResult::CompileError
+        }
+    }
+}
+
+/// 释放 PDF 缓冲区
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn typst_free_buffer(buffer: *mut TypstPdfBuffer) {
+    if buffer.is_null() {
+        return;
+    }
+    let buf = &*buffer;
+    if !buf.data.is_null() && buf.capacity > 0 {
+        let _ = Vec::from_raw_parts(buf.data, buf.len, buf.capacity);
+    }
+    (*buffer).data = ptr::null_mut();
+    (*buffer).len = 0;
+    (*buffer).capacity = 0;
+}
+
+/// 获取错误信息字符串
+#[unsafe(no_mangle)]
+pub extern "C" fn typst_result_message(result: TypstResult) -> *const c_char {
+    let msg = match result {
+        TypstResult::Success => "Success\0",
+        TypstResult::InvalidInputPath => "Invalid input path\0",
+        TypstResult::InvalidOutputPath => "Invalid output path\0",
+        TypstResult::ReadError => "Failed to read file\0",
+        TypstResult::CompileError => "Compilation error\0",
+        TypstResult::ExportError => "PDF export error\0",
+        TypstResult::WriteError => "Failed to write file\0",
+        TypstResult::InvalidUtf8 => "Invalid UTF-8 string\0",
+        TypstResult::MemoryError => "Memory allocation error\0",
+    };
+    msg.as_ptr() as *const c_char
+}
+
+/// 获取库版本
+#[unsafe(no_mangle)]
+pub extern "C" fn typst_version() -> *const c_char {
+    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+}
