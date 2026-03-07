@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use typst::diag::{FileError, FileResult};
 use typst::syntax::package::PackageSpec;
-use typst_kit::package::PackageStorage;
 use std::ffi::CString;
 
 fn get_packages_base_dir() -> PathBuf {
@@ -30,7 +29,7 @@ pub fn download_package(spec: &PackageSpec) -> FileResult<PathBuf> {
     let temp_base = get_packages_base_dir();
     
     // 我们按照官方或者我们约定的格式寻找 {namespace}/{name}/{version}
-    let mut package_dir = temp_base.join(spec.namespace.as_str()).join(spec.name.as_str()).join(spec.version.to_string());
+    let package_dir = temp_base.join(spec.namespace.as_str()).join(spec.name.as_str()).join(spec.version.to_string());
     
     // 有时系统存储包的路径有多个版本。我们可以先探测缓存，如果有直接返回成功。
     if package_dir.exists() && package_dir.is_dir() {

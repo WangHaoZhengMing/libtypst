@@ -346,7 +346,7 @@ pub unsafe extern "C" fn typst_free_buffer(buffer: *mut TypstPdfBuffer) {
 
 /// 获取错误信息字符串
 #[unsafe(no_mangle)]
-pub extern "C" fn typst_result_message(result: TypstResult) -> *const c_char {
+pub extern "C" fn typst_result_message(_result: TypstResult) -> *const c_char {
     match last_error_storage().lock() {
         Ok(guard) => guard.as_ptr() as *const c_char,
         Err(_) => b"Unknown error\0".as_ptr() as *const c_char,
