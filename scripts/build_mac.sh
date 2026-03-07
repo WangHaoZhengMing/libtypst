@@ -16,15 +16,26 @@ done
 
 echo "Building with profile: $PROFILE"
 
-# Add required rust targets
-rustup target add x86_64-apple-darwin
-rustup target add aarch64-apple-darwin
+# Detect current architecture
+ARCH=$(uname -m)
+if [ "$ARCH" = "x86_64" ]; then
+    TARGET="x86_64-apple-darwin"
+elif [ "$ARCH" = "arm64" ]; then
+    TARGET="aarch64-apple-darwin"
+else
+    echo "Unsupported architecture: $ARCH"
+    exit 1
+fi
 
-# Build both architecture versions with specified profile
-echo "Building x86_64 architecture..."
-cargo build --profile $PROFILE --target x86_64-apple-darwin
-echo "Building aarch64 architecture..."
-cargo build --profile $PROFILE --target aarch64-apple-darwin
+echo "Detected architecture: $ARCH"
+echo "Target: $TARGET"
+
+# Add required rust target
+rustup target add $TARGET
+
+# Build for current architecture
+echo "Building for $TARGET..."
+cargo build --profile $PROFILE --target $TARGET
 
 # Ensure the output directory exists
 mkdir -p universal-macos
@@ -36,18 +47,12 @@ else
     OUTPUT_DIR="$PROFILE"
 fi
 
-# Use lipo to merge dylib and staticlib
-echo "Creating universal dylib..."
-lipo -create -output universal-macos/libtypst_c.dylib \
-    target/x86_64-apple-darwin/$OUTPUT_DIR/libtypst_c.dylib \
-    target/aarch64-apple-darwin/$OUTPUT_DIR/libtypst_c.dylib
+# Copy artifacts to output directory
+echo "Copying artifacts to universal-macos directory..."
+cp target/$TARGET/$OUTPUT_DIR/libtypst_c.dylib universal-macos/libtypst_c.dylib
+cp target/$TARGET/$OUTPUT_DIR/libtypst_c.a universal-macos/libtypst_c.a
 
-echo "Creating universal static library..."
-lipo -create -output universal-macos/libtypst_c.a \
-    target/x86_64-apple-darwin/$OUTPUT_DIR/libtypst_c.a \
-    target/aarch64-apple-darwin/$OUTPUT_DIR/libtypst_c.a
-
-echo "Universal binaries (x86_64 & aarch64) have been created in the universal-macos directory."
+echo "Binaries for $ARCH have been created in the universal-macos directory."
 
 # Show binary sizes
 echo "=== Binary Size Information ==="

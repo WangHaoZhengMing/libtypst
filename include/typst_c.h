@@ -28,6 +28,8 @@ typedef enum TypstResult {
   MemoryError = 8,
 } TypstResult;
 
+typedef bool (*TypstDownloadFunc)(const char *url, const char *dest_path);
+
 // PDF 输出缓冲区
 typedef struct TypstPdfBuffer {
   // 指向 PDF 数据的指针
@@ -37,6 +39,10 @@ typedef struct TypstPdfBuffer {
   // 容量（内部使用）
   uintptr_t capacity;
 } TypstPdfBuffer;
+
+void typst_set_network_downloader(TypstDownloadFunc cb);
+
+void typst_set_shared_group_path(const char *path);
 
 // 从文件编译 Typst 到 PDF 文件
 enum TypstResult typst_compile_file(const char *input_path, const char *output_path);

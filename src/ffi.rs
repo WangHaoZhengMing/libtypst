@@ -8,6 +8,32 @@ use typst_pdf::PdfOptions;
 
 use crate::world::SimpleWorld;
 
+pub type TypstDownloadFunc = extern "C" fn(url: *const c_char, dest_path: *const c_char) -> bool;
+
+pub static mut DOWNLOAD_CALLBACK: Option<TypstDownloadFunc> = None;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn typst_set_network_downloader(cb: TypstDownloadFunc) {
+    unsafe {
+        DOWNLOAD_CALLBACK = Some(cb);
+    }
+}
+
+pub static mut SHARED_GROUP_PATH: Option<String> = None;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn typst_set_shared_group_path(path: *const c_char) {
+    if path.is_null() {
+        unsafe { SHARED_GROUP_PATH = None; }
+        return;
+    }
+    if let Ok(s) = unsafe { CStr::from_ptr(path).to_str() } {
+        unsafe {
+            SHARED_GROUP_PATH = Some(s.to_string());
+        }
+    }
+}
+
 /// 编译结果状态码
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 #[repr(C)]
@@ -104,13 +130,22 @@ pub unsafe extern "C" fn typst_compile_file(
                 Ok(pdf_data) => {
                     match fs::write(&output, pdf_data) {
                         Ok(_) => TypstResult::Success,
-                        Err(_) => TypstResult::WriteError,
+                        Err(e) => {
+                            eprintln!("WRITE ERROR: {:?}", e);
+                            TypstResult::WriteError
+                        }
                     }
                 }
-                Err(_) => TypstResult::ExportError,
+                Err(e) => {
+                    eprintln!("EXPORT ERROR: {:?}", e);
+                    TypstResult::ExportError
+                }
             }
         }
-        Err(_) => TypstResult::CompileError,
+        Err(e) => {
+            eprintln!("COMPILE ERROR: {:?}", e);
+            TypstResult::CompileError
+        }
     }
 }
 

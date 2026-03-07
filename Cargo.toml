@@ -13,6 +13,9 @@ typst-pdf = "0.14.2"
 typst-kit = "0.14.2"
 chrono = "0.4.44"
 parking_lot = "0.12"
+tar = "0.4.44"
+flate2 = "1.1.9"
+dirs = "6.0.0"
 
 
 [dev-dependencies]
