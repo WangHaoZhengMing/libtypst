@@ -5,6 +5,7 @@
 
 pub mod ffi;
 pub mod package;
+pub mod placeholder;
 pub mod world;
 
 pub use ffi::*;

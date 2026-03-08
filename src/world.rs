@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
-use parking_lot::RwLock;
 use typst::diag::{FileError, FileResult};
 use typst::foundations::{Bytes, Datetime};
 use typst::utils::LazyHash;
@@ -19,6 +19,8 @@ use typst::{Library, LibraryExt, World};
 pub struct SimpleWorld {
     /// 主源文件
     main: Source,
+    /// 主源文本
+    main_text: String,
     /// 字体书
     book: LazyHash<FontBook>,
     /// 字体列表
@@ -48,6 +50,7 @@ impl SimpleWorld {
         
         Self {
             main,
+            main_text: source.to_string(),
             book: LazyHash::new(fonts.book),
             fonts: fonts.fonts,
             library: LazyHash::new(Library::default()),
@@ -66,6 +69,188 @@ impl SimpleWorld {
         } else {
             id.vpath().resolve(&self.root).ok_or_else(|| FileError::AccessDenied)
         }
+    }
+
+    fn is_sandbox_denied(error: &std::io::Error) -> bool {
+        matches!(error.kind(), ErrorKind::PermissionDenied)
+    }
+
+    fn placeholder_source(&self, path: &Path) -> String {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("typ") {
+            if let Some(module_stub) = self.placeholder_module_source(path) {
+                return module_stub;
+            }
+        }
+
+        crate::placeholder::placeholder_source_comment(path)
+    }
+
+    fn placeholder_module_source(&self, path: &Path) -> Option<String> {
+        let import_suffixes = self.import_path_suffixes(path);
+        let import_line = self
+            .main_text
+            .lines()
+            .map(str::trim)
+            .find(|line| {
+                line.starts_with("#import ")
+                    && import_suffixes.iter().any(|suffix| line.contains(&format!("\"{}\"", suffix)))
+            })?;
+
+        let exports = if let Some((_, clause)) = import_line.split_once(':') {
+            let clause = clause.trim();
+            if clause == "*" {
+                self.infer_star_import_exports()
+            } else {
+                self.parse_named_imports(clause)
+            }
+        } else {
+            Vec::new()
+        };
+
+        if exports.is_empty() {
+            return None;
+        }
+
+        let mut stub = format!(
+            "// Sandbox blocked access to external Typst module: {}\n",
+            path.display()
+        );
+
+        for (name, is_function) in exports {
+            if is_function {
+                stub.push_str(&format!("#let {}(..args) = []\n", name));
+            } else {
+                stub.push_str(&format!("#let {} = []\n", name));
+            }
+        }
+
+        Some(stub)
+    }
+
+    fn import_path_suffixes(&self, path: &Path) -> Vec<String> {
+        let mut suffixes = Vec::new();
+
+        if let Ok(relative) = path.strip_prefix(&self.root) {
+            suffixes.push(relative.to_string_lossy().replace('\\', "/"));
+        }
+
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            let name = name.to_string();
+            if !suffixes.contains(&name) {
+                suffixes.push(name);
+            }
+        }
+
+        suffixes
+    }
+
+    fn parse_named_imports(&self, clause: &str) -> Vec<(String, bool)> {
+        clause
+            .split(',')
+            .filter_map(|part| {
+                let binding = part.trim();
+                if binding.is_empty() || binding == "*" {
+                    return None;
+                }
+
+                let imported_name = binding
+                    .split_once(" as ")
+                    .map(|(_, alias)| alias.trim())
+                    .unwrap_or(binding);
+
+                if imported_name.is_empty() {
+                    return None;
+                }
+
+                Some((
+                    imported_name.to_string(),
+                    self.main_text.contains(&format!("#{}(", imported_name)),
+                ))
+            })
+            .collect()
+    }
+
+    fn infer_star_import_exports(&self) -> Vec<(String, bool)> {
+        let local_defs = self.local_definitions();
+        let chars: Vec<char> = self.main_text.chars().collect();
+        let mut exports = Vec::new();
+        let mut index = 0;
+
+        while index < chars.len() {
+            if chars[index] != '#' {
+                index += 1;
+                continue;
+            }
+
+            let mut cursor = index + 1;
+            while cursor < chars.len() && chars[cursor].is_whitespace() {
+                cursor += 1;
+            }
+
+            if cursor >= chars.len() || !Self::is_ident_start(chars[cursor]) {
+                index += 1;
+                continue;
+            }
+
+            let start = cursor;
+            cursor += 1;
+            while cursor < chars.len() && Self::is_ident_continue(chars[cursor]) {
+                cursor += 1;
+            }
+
+            let name: String = chars[start..cursor].iter().collect();
+            let is_custom = name.chars().any(|ch| !ch.is_ascii());
+            if !is_custom || local_defs.iter().any(|defined| defined == &name) {
+                index = cursor;
+                continue;
+            }
+
+            let mut lookahead = cursor;
+            while lookahead < chars.len() && chars[lookahead].is_whitespace() {
+                lookahead += 1;
+            }
+            let is_function = lookahead < chars.len() && chars[lookahead] == '(';
+
+            if !exports.iter().any(|(existing, _)| existing == &name) {
+                exports.push((name, is_function));
+            }
+
+            index = cursor;
+        }
+
+        exports
+    }
+
+    fn local_definitions(&self) -> Vec<String> {
+        self.main_text
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| {
+                let rest = line.strip_prefix("#let ")?;
+                let mut end = 0;
+                for ch in rest.chars() {
+                    if Self::is_ident_continue(ch) {
+                        end += ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+
+                if end == 0 {
+                    None
+                } else {
+                    Some(rest[..end].to_string())
+                }
+            })
+            .collect()
+    }
+
+    fn is_ident_start(ch: char) -> bool {
+        ch == '_' || ch.is_alphabetic()
+    }
+
+    fn is_ident_continue(ch: char) -> bool {
+        ch == '_' || ch == '-' || ch.is_alphanumeric()
     }
 }
 
@@ -88,26 +273,42 @@ impl World for SimpleWorld {
         }
         
         // 检查缓存
-        if let Some(source) = self.files.read().get(&id) {
-            return Ok(source.clone());
+        if let Ok(files) = self.files.read() {
+            if let Some(source) = files.get(&id) {
+                return Ok(source.clone());
+            }
         }
 
         // 从文件系统读取
         let path = self.resolve_path(id)?;
 
-        let content = fs::read_to_string(&path)
-            .map_err(|e| FileError::from_io(e, &path))?;
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) if Self::is_sandbox_denied(&error) => {
+                eprintln!("SANDBOX FALLBACK source: {}", path.display());
+                self.placeholder_source(&path)
+            }
+            Err(error) => return Err(FileError::from_io(error, &path)),
+        };
 
         let source = Source::new(id, content.into());
-        self.files.write().insert(id, source.clone());
+        if let Ok(mut files) = self.files.write() {
+            files.insert(id, source.clone());
+        }
         Ok(source)
     }
 
     fn file(&self, id: FileId) -> FileResult<Bytes> {
         let path = self.resolve_path(id)?;
         
-        let data = fs::read(&path)
-            .map_err(|e| FileError::from_io(e, &path))?;
+        let data = match fs::read(&path) {
+            Ok(data) => data,
+            Err(error) if Self::is_sandbox_denied(&error) => {
+                eprintln!("SANDBOX FALLBACK file: {}", path.display());
+                crate::placeholder::placeholder_bytes(&path)
+            }
+            Err(error) => return Err(FileError::from_io(error, &path)),
+        };
         
         Ok(Bytes::new(data))
     }

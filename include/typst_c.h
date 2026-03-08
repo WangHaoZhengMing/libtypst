@@ -61,7 +61,7 @@ enum TypstResult typst_compile_to_buffer(const char *source,
 void typst_free_buffer(struct TypstPdfBuffer *buffer);
 
 // 获取错误信息字符串
-const char *typst_result_message(enum TypstResult result);
+const char *typst_result_message(enum TypstResult _result);
 
 // 获取库版本
 const char *typst_version(void);
